@@ -104,7 +104,7 @@ def read_rigol_bin(path: Path) -> Tuple[np.ndarray, Dict]:
             # Per-channel y_units
             f.seek(68 + stride * i, 0)
             (yu_code,) = _read_struct(f, "I")
-            unit = UNIT_TYPES[yu_code + 1] if 0 <= yu_code < len(UNIT_TYPES) - 1 else "Unknown"
+            unit = UNIT_TYPES[yu_code] if 0 <= yu_code < len(UNIT_TYPES) - 1 else "Unknown"
             ch_units.append(unit)
 
             # Per-channel name
@@ -223,12 +223,8 @@ def write_wavs_and_metadata(
     meta = dict(nfo)
     meta.update({
         "output_base": base_out.name,
-        "wav_sample_rate_hz": sample_rate,
+        "sample_rate": sample_rate,
         "channels": ch_stats,
-        "time_axis_equations": {
-            "screen_save": "t = -x_origin + x_increment * (0..n_pts-1)",
-            "memory_save": "t = x_start + x_increment * (0..n_pts-1)",
-        },
     })
 
     json_path = base_out.with_suffix(".json")
