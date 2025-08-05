@@ -16,9 +16,10 @@ WAV:
 - dtype 'int16' writes PCM16 via the same function.
 - `--normalize peak` scales per-channel peak to `--target-peak` (float WAV uses [-1,1] scale; int16 uses full-scale 32767).
 - `--normalize none` preserves original volt units (float WAV can exceed 1.0 if your volts are large; most DAWs handle it).
+- `--zero-mean` subtracts the per-channel mean **before** normalization to remove DC and maximize dynamic range.
 
 Usage:
-  uv run --with numpy --with scipy rigol_bin_to_wav.py input.bin --wav-dtype float32
+  uv run --with numpy --with scipy rigol_bin_to_wav.py input.bin --wav-dtype float32 --zero-mean
 """
 
 from __future__ import annotations
@@ -159,11 +160,12 @@ def write_wavs_and_metadata(
     wav_dtype: str = "float32",
     normalize: str = "peak",
     target_peak: float = 0.98,
+    zero_mean: bool = False,
 ) -> Dict:
     """
     Write one WAV per channel and a JSON metadata file.
     wav_dtype: 'float32' (IEEE float) or 'int16'
-    normalize: 'peak' or 'none'
+    normalize: 'peak' or 'none'. If zero_mean is True, subtract mean before scaling.
     """
     base_out.parent.mkdir(parents=True, exist_ok=True)
     sr = nfo.get("sample_rate_nominal_hz")
@@ -174,7 +176,11 @@ def write_wavs_and_metadata(
     ch_stats: List[Dict] = []
     for i, ch_name in enumerate(nfo["channel_names"]):
         y = Y[i, :].astype(np.float64, copy=False)
-        absmax = float(np.max(np.abs(y))) if y.size else 0.0
+
+        # Centering (optional) and stats
+        mean_pre = float(np.mean(y)) if y.size else 0.0
+        y_proc = y - mean_pre if (zero_mean and y.size) else y
+        absmax_proc = float(np.max(np.abs(y_proc))) if y_proc.size else 0.0
 
         safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in ch_name) or f"CH{i+1}"
         wav_path = base_out.with_name(f"{base_out.name}_ch{i+1}_{safe_name}.wav")
@@ -182,24 +188,27 @@ def write_wavs_and_metadata(
         if wav_dtype == "float32":
             # In float WAV, typical full-scale is +/-1.0
             if normalize == "peak":
-                scale = (target_peak / absmax) if absmax > 0 else 1.0
+                scale = (target_peak / absmax_proc) if absmax_proc > 0 else 1.0
             elif normalize == "none":
                 scale = 1.0
             else:
                 raise ValueError("normalize must be 'peak' or 'none'")
-            y_out = (y * scale).astype(np.float32, copy=False)
+            y_out = (y_proc * scale).astype(np.float32, copy=False)
             sciowav.write(str(wav_path), sample_rate, y_out)
         elif wav_dtype == "int16":
             if normalize == "peak":
-                scale = (target_peak * 32767.0 / absmax) if absmax > 0 else 1.0
+                scale = (target_peak * 32767.0 / absmax_proc) if absmax_proc > 0 else 1.0
             elif normalize == "none":
                 scale = 1.0
             else:
                 raise ValueError("normalize must be 'peak' or 'none'")
-            y_i16 = np.clip(np.rint(y * scale), -32768, 32767).astype(np.int16, copy=False)
+            y_i16 = np.clip(np.rint(y_proc * scale), -32768, 32767).astype(np.int16, copy=False)
             sciowav.write(str(wav_path), sample_rate, y_i16)
         else:
             raise ValueError("wav_dtype must be 'float32' or 'int16'")
+
+        # Post-centering stats (pre-scaling mean is sufficient since scaling doesn't affect zero-mean)
+        mean_post = float(np.mean(y_proc)) if y_proc.size else 0.0
 
         ch_stats.append({
             "channel_index": i + 1,
@@ -209,13 +218,17 @@ def write_wavs_and_metadata(
             "wav_dtype": wav_dtype,
             "normalize": normalize,
             "target_peak": target_peak if normalize == "peak" else None,
-            "scale_applied": None if absmax == 0 else (
-                target_peak / absmax if wav_dtype == "float32" and normalize == "peak" else
-                (target_peak * 32767.0 / absmax) if wav_dtype == "int16" and normalize == "peak" else
+            "zero_mean_applied": bool(zero_mean),
+            "dc_offset_removed_volts": mean_pre if zero_mean else 0.0,
+            "scale_applied": None if absmax_proc == 0 else (
+                target_peak / absmax_proc if wav_dtype == "float32" and normalize == "peak" else
+                (target_peak * 32767.0 / absmax_proc) if wav_dtype == "int16" and normalize == "peak" else
                 1.0
             ),
-            "absmax_input_volts": absmax,
-            "mean_volts": float(np.mean(y)) if y.size else 0.0,
+            "absmax_input_volts": float(np.max(np.abs(y))) if y.size else 0.0,
+            "absmax_post_center_volts": absmax_proc,
+            "mean_volts": mean_pre,
+            "mean_volts_post": mean_post,
             "min_volts": float(np.min(y)) if y.size else 0.0,
             "max_volts": float(np.max(y)) if y.size else 0.0,
         })
@@ -225,6 +238,7 @@ def write_wavs_and_metadata(
         "output_base": base_out.name,
         "sample_rate": sample_rate,
         "channels": ch_stats,
+        "zero_mean": bool(zero_mean),
     })
 
     json_path = base_out.with_suffix(".json")
@@ -244,6 +258,8 @@ def main():
                     help="Scaling: 'peak' maps channel peak to target; 'none' preserves raw volts.")
     ap.add_argument("--target-peak", type=float, default=0.98,
                     help="When normalize=peak, map channel peak to this fraction of FS.")
+    ap.add_argument("--zero-mean", action="store_true",
+                    help="Subtract per-channel mean before scaling/writing (DC removal) to maximize dynamic range.")
     args = ap.parse_args()
 
     in_path: Path = args.input
@@ -260,6 +276,7 @@ def main():
         wav_dtype=args.wav_dtype,
         normalize=args.normalize,
         target_peak=args.target_peak,
+        zero_mean=args.zero_mean,
     )
 
     print(f"Wrote metadata: {base.with_suffix('.json')}")
